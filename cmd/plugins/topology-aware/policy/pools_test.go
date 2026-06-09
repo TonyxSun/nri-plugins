@@ -18,9 +18,12 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	cfgapi "github.com/containers/nri-plugins/pkg/apis/config/v1alpha1/resmgr/policy/topologyaware"
 	libmem "github.com/containers/nri-plugins/pkg/resmgr/lib/memory"
@@ -206,37 +209,7 @@ func TestPoolCreation(t *testing.T) {
 //   - pinMemory=true: strict accounting must be preserved, i.e. the overcommit
 //     is still rejected with libmem's ErrNoMem ("failed to get offer").
 func TestFailOpenMemoryAdmission(t *testing.T) {
-	// Create a temporary directory for the test data.
-	dir, err := os.MkdirTemp("", "nri-resource-policy-test-sysfs-")
-	if err != nil {
-		panic(err)
-	}
-	defer removeAll(t, dir)
-
-	// Uncompress the test data to the directory.
-	if err := utils.UncompressTbz2(path.Join("testdata", "sysfs.tar.bz2"), dir); err != nil {
-		panic(err)
-	}
-
-	sys, err := system.DiscoverSystemAt(path.Join(dir, "sysfs", "desktop", "sys"))
-	if err != nil {
-		panic(err)
-	}
-
-	policyOptions := &policyapi.BackendOptions{
-		Cache:  &mockCache{},
-		System: sys,
-		Config: &cfgapi.Config{
-			ReservedResources: cfgapi.Constraints{
-				cfgapi.CPU: "750m",
-			},
-		},
-	}
-
-	policy := New().(*policy)
-	if err := policy.Setup(policyOptions); err != nil {
-		t.Fatalf("failed to setup test policy: %v", err)
-	}
+	policy := setupDesktopPolicy(t)
 	require.NotNil(t, policy.memAllocator, "policy.Setup must build a memory allocator")
 
 	// A request far larger than any test system's physical memory overcommits
@@ -260,6 +233,125 @@ func TestFailOpenMemoryAdmission(t *testing.T) {
 		require.ErrorIs(t, err, libmem.ErrNoMem, "pinMemory=true must fail with ErrNoMem")
 		require.Nil(t, o, "pinMemory=true must not return an offer on overcommit")
 	})
+}
+
+// sharedSysfs extracts the sysfs test fixture once per test process (the bz2
+// decompress is expensive) and returns the path to the "desktop" sys tree.
+var (
+	sharedSysfsOnce sync.Once
+	sharedSysfsDir  string
+)
+
+func desktopSysfsPath() string {
+	sharedSysfsOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "nri-resource-policy-test-sysfs-")
+		if err != nil {
+			panic(err)
+		}
+		if err := utils.UncompressTbz2(path.Join("testdata", "sysfs.tar.bz2"), dir); err != nil {
+			panic(err)
+		}
+		sharedSysfsDir = dir
+	})
+	return path.Join(sharedSysfsDir, "sysfs", "desktop", "sys")
+}
+
+// setupDesktopPolicy builds a topology-aware policy on the single-NUMA "desktop"
+// sysfs test fixture (20 CPUs, ~62Gi DRAM).
+func setupDesktopPolicy(t *testing.T) *policy {
+	sys, err := system.DiscoverSystemAt(desktopSysfsPath())
+	if err != nil {
+		panic(err)
+	}
+	p := New().(*policy)
+	opts := &policyapi.BackendOptions{
+		Cache:  &mockCache{},
+		System: sys,
+		Config: &cfgapi.Config{
+			ReservedResources: cfgapi.Constraints{cfgapi.CPU: "750m"},
+		},
+	}
+	if err := p.Setup(opts); err != nil {
+		t.Fatalf("failed to setup test policy: %v", err)
+	}
+	return p
+}
+
+// TestFailOpenDoesNotMaskCPUFailure (KUB-3192) verifies the memory fail-open does
+// NOT mask CPU allocation failures. supply.Allocate allocates CPU before memory,
+// so a container requesting more CPUs than the node has must still fail
+// AllocateResources even with pinMemory=false.
+func TestFailOpenDoesNotMaskCPUFailure(t *testing.T) {
+	p := setupDesktopPolicy(t)
+
+	opt.PinMemory = false
+	opt.PinCPU = true
+
+	ctr := &mockContainer{
+		name:                "cpuhog",
+		namespace:           "testns",
+		returnValueForGetID: "cpuhog",
+		returnValueForGetResourceRequirements: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+		},
+		pod: &mockPod{name: "cpuhog-pod", returnValueFotGetQOSClass: corev1.PodQOSGuaranteed},
+	}
+
+	err := p.AllocateResources(ctr)
+	require.Error(t, err, "CPU allocation failure must stay fatal even when pinMemory=false")
+}
+
+// TestFailOpenStillAppliesCPUPinning (KUB-3192) verifies that when memory admission
+// fails open (pinMemory=false), the container still gets its CPU cpuset applied
+// while memory is left unpinned (empty cpuset.mems). The paired pinMemory=true case
+// confirms strict memory admission still rejects the same overcommit.
+func TestFailOpenStillAppliesCPUPinning(t *testing.T) {
+	p := setupDesktopPolicy(t)
+
+	opt.PinCPU = true
+
+	// Burstable container whose memory request (200Gi) far exceeds the node's
+	// ~62Gi capacity -> memory overcommit. CPU is a small shared request that fits.
+	newCtr := func(id string) *mockContainer {
+		return &mockContainer{
+			name:                "victim",
+			namespace:           "testns",
+			returnValueForGetID: id,
+			returnValueForGetResourceRequirements: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("500m"),
+					corev1.ResourceMemory: resource.MustParse("200Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceMemory: resource.MustParse("200Gi"),
+				},
+			},
+			pod: &mockPod{name: "victim-pod", returnValueFotGetQOSClass: corev1.PodQOSBurstable},
+		}
+	}
+
+	// pinMemory=true: strict admission still rejects the memory overcommit.
+	opt.PinMemory = true
+	require.Error(t, p.AllocateResources(newCtr("victim-strict")),
+		"pinMemory=true must reject the memory overcommit")
+
+	// pinMemory=false: fail open -> allocation succeeds, CPU is still pinned, and
+	// memory is left unpinned (empty cpuset.mems).
+	opt.PinMemory = false
+	ctr := newCtr("victim-failopen")
+	require.NoError(t, p.AllocateResources(ctr),
+		"pinMemory=false must fail open on the memory overcommit")
+	require.True(t, ctr.cpusetCpusUpdated, "CPU cpuset must still be applied under fail-open")
+	require.NotEmpty(t, ctr.recordedCpusetCpus, "CPU cpuset must be non-empty under fail-open")
+	require.Empty(t, ctr.recordedCpusetMems,
+		"memory must be left unpinned (empty cpuset.mems) when pinMemory=false")
 }
 
 func TestWorkloadPlacement(t *testing.T) {

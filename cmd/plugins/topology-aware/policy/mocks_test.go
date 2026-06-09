@@ -364,6 +364,12 @@ type mockContainer struct {
 	returnValueForGetID                   string
 	returnValueForQOSClass                v1.PodQOSClass
 	pod                                   cache.Pod
+
+	// recorded by SetCpusetCpus/SetCpusetMems for assertions in tests
+	recordedCpusetCpus string
+	cpusetCpusUpdated  bool
+	recordedCpusetMems string
+	cpusetMemsUpdated  bool
 }
 
 func (m *mockContainer) GetPod() (cache.Pod, bool) {
@@ -487,9 +493,13 @@ func (m *mockContainer) SetCPUPeriod(int64) {
 func (m *mockContainer) SetCPUQuota(int64) {
 	panic("unimplemented")
 }
-func (m *mockContainer) SetCpusetCpus(string) {
+func (m *mockContainer) SetCpusetCpus(s string) {
+	m.recordedCpusetCpus = s
+	m.cpusetCpusUpdated = true
 }
-func (m *mockContainer) SetCpusetMems(string) {
+func (m *mockContainer) SetCpusetMems(s string) {
+	m.recordedCpusetMems = s
+	m.cpusetMemsUpdated = true
 }
 func (m *mockContainer) SetMemoryLimit(int64) {
 	panic("unimplemented")
