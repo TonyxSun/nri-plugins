@@ -1450,3 +1450,65 @@ func (s *testSetup) nodes(t *testing.T) []*Node {
 
 	return nodes
 }
+
+// TestFailOpenHandleOvercommit covers the libmem extension point that the
+// topology-aware policy uses for its fail-open memory admission fix (KUB-3192).
+// A custom HandleOvercommit that returns nil must make GetOffer succeed even
+// when a zone is overcommitted (the pinMemory=false case), while delegating to
+// DefaultHandleOvercommit must still reject the overcommit with ErrNoMem (the
+// pinMemory=true case).
+func TestFailOpenHandleOvercommit(t *testing.T) {
+	setup := &testSetup{
+		description: "2 DRAM NUMA nodes, 4 bytes per node",
+		types:       []Type{TypeDRAM, TypeDRAM},
+		capacities:  []int64{4, 4},
+		movability:  []bool{normal, normal},
+		closeCPUs:   [][]int{{0, 1}, {2, 3}},
+		distances: [][]int{
+			{10, 21},
+			{21, 10},
+		},
+	}
+
+	// A single 16-byte request against an 8-byte (2x4) system overcommits the
+	// whole node (zone nodes{0,1}), reproducing the production failure mode
+	// ("failed to resolve overcommit, zones nodes{0-1} overcommit by ...").
+	newOvercommit := func() *Request {
+		return ContainerWithTypes("victim", "victim", "burstable", 16, NewNodeMask(0, 1), TypeMaskDRAM)
+	}
+
+	t.Run("fail-open handler accepts overcommit", func(t *testing.T) {
+		a, err := NewAllocator(
+			WithNodes(setup.nodes(t)),
+			WithCustomFunctions(&CustomFunctions{
+				HandleOvercommit: func(map[NodeMask]int64, CustomAllocator) error {
+					return nil // fail open, mimicking pinMemory=false
+				},
+			}),
+		)
+		require.Nil(t, err)
+		require.NotNil(t, a)
+
+		o, err := a.GetOffer(newOvercommit())
+		require.Nil(t, err, "fail-open handler must accept the overcommit")
+		require.NotNil(t, o, "fail-open handler must return a valid offer")
+	})
+
+	t.Run("default handler rejects overcommit", func(t *testing.T) {
+		a, err := NewAllocator(
+			WithNodes(setup.nodes(t)),
+			WithCustomFunctions(&CustomFunctions{
+				HandleOvercommit: func(oc map[NodeMask]int64, a CustomAllocator) error {
+					return a.DefaultHandleOvercommit(oc) // strict, mimicking pinMemory=true
+				},
+			}),
+		)
+		require.Nil(t, err)
+		require.NotNil(t, a)
+
+		o, err := a.GetOffer(newOvercommit())
+		require.NotNil(t, err, "default handler must reject the overcommit")
+		require.ErrorIs(t, err, ErrNoMem, "default handler must fail with ErrNoMem")
+		require.Nil(t, o, "no offer expected when overcommit is rejected")
+	})
+}

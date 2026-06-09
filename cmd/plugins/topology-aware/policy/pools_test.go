@@ -20,7 +20,10 @@ import (
 	"path"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	cfgapi "github.com/containers/nri-plugins/pkg/apis/config/v1alpha1/resmgr/policy/topologyaware"
+	libmem "github.com/containers/nri-plugins/pkg/resmgr/lib/memory"
 	policyapi "github.com/containers/nri-plugins/pkg/resmgr/policy"
 
 	system "github.com/containers/nri-plugins/pkg/sysfs"
@@ -193,6 +196,70 @@ func TestPoolCreation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestFailOpenMemoryAdmission is the policy-level regression for KUB-3192.
+// It drives the live memory allocator that policy.Setup builds (which installs
+// the fail-open HandleOvercommit closure reading opt.PinMemory at call time):
+//   - pinMemory=false: an overcommitting request must be admitted (fail open),
+//     matching the fact that the policy never writes cpuset.mems in that mode.
+//   - pinMemory=true: strict accounting must be preserved, i.e. the overcommit
+//     is still rejected with libmem's ErrNoMem ("failed to get offer").
+func TestFailOpenMemoryAdmission(t *testing.T) {
+	// Create a temporary directory for the test data.
+	dir, err := os.MkdirTemp("", "nri-resource-policy-test-sysfs-")
+	if err != nil {
+		panic(err)
+	}
+	defer removeAll(t, dir)
+
+	// Uncompress the test data to the directory.
+	if err := utils.UncompressTbz2(path.Join("testdata", "sysfs.tar.bz2"), dir); err != nil {
+		panic(err)
+	}
+
+	sys, err := system.DiscoverSystemAt(path.Join(dir, "sysfs", "desktop", "sys"))
+	if err != nil {
+		panic(err)
+	}
+
+	policyOptions := &policyapi.BackendOptions{
+		Cache:  &mockCache{},
+		System: sys,
+		Config: &cfgapi.Config{
+			ReservedResources: cfgapi.Constraints{
+				cfgapi.CPU: "750m",
+			},
+		},
+	}
+
+	policy := New().(*policy)
+	if err := policy.Setup(policyOptions); err != nil {
+		t.Fatalf("failed to setup test policy: %v", err)
+	}
+	require.NotNil(t, policy.memAllocator, "policy.Setup must build a memory allocator")
+
+	// A request far larger than any test system's physical memory overcommits
+	// the whole node, reproducing the libmem failure the fix addresses.
+	newOvercommit := func() *libmem.Request {
+		return libmem.ContainerWithTypes("victim", "victim", "burstable",
+			1<<60, libmem.NewNodeMask(0), libmem.TypeMaskDRAM)
+	}
+
+	t.Run("pinMemory=false admits overcommit", func(t *testing.T) {
+		opt.PinMemory = false
+		o, err := policy.memAllocator.GetOffer(newOvercommit())
+		require.Nil(t, err, "pinMemory=false must fail open on overcommit")
+		require.NotNil(t, o, "pinMemory=false must return a valid offer")
+	})
+
+	t.Run("pinMemory=true rejects overcommit", func(t *testing.T) {
+		opt.PinMemory = true
+		o, err := policy.memAllocator.GetOffer(newOvercommit())
+		require.NotNil(t, err, "pinMemory=true must preserve strict admission")
+		require.ErrorIs(t, err, libmem.ErrNoMem, "pinMemory=true must fail with ErrNoMem")
+		require.Nil(t, o, "pinMemory=true must not return an offer on overcommit")
+	})
 }
 
 func TestWorkloadPlacement(t *testing.T) {
