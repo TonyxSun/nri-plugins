@@ -225,6 +225,10 @@ func (p *policy) checkAllocations(format string, args ...interface{}) {
 func (p *policy) AllocateResources(container cache.Container) error {
 	log.Debug("allocating resources for %s (%s)...", container.PrettyName(), container.GetID())
 
+	// A restarted container reappears with a new CRI ID; reclaim any grant left
+	// by a prior instance so the shared pool is not double-charged.
+	p.releaseStaleInstances(container)
+
 	err := p.allocateResources(container, "")
 	if err != nil {
 		return err
@@ -236,6 +240,31 @@ func (p *policy) AllocateResources(container cache.Container) error {
 	p.metrics.Update()
 
 	return nil
+}
+
+// releaseStaleInstances reclaims grants left behind by a previous instance of
+// the same container (same PrettyName, different CRI ID), mirroring the release
+// path of ReleaseResources. It is idempotent: with no such grant it is a no-op.
+func (p *policy) releaseStaleInstances(container cache.Container) {
+	name := container.PrettyName()
+	id := container.GetID()
+
+	// Collect first: releasePool() mutates p.allocations.grants.
+	var stale []cache.Container
+	for _, g := range p.allocations.grants {
+		other := g.GetContainer()
+		if other.PrettyName() == name && other.GetID() != id {
+			stale = append(stale, other)
+		}
+	}
+
+	for _, other := range stale {
+		log.Warn("reclaiming stale grant for %s: replacing instance %s with %s",
+			name, other.GetID(), id)
+		if grant, found := p.releasePool(other); found {
+			p.updateSharedAllocations(&grant)
+		}
+	}
 }
 
 func (p *policy) allocateResources(container cache.Container, poolHint string) error {
