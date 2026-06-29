@@ -97,7 +97,24 @@ func (p *policy) Setup(opts *policyapi.BackendOptions) error {
 	p.sys = opts.System
 	p.options = opts
 	p.cpuAllocator = cpuallocator.NewCPUAllocator(opts.System)
-	p.memAllocator, err = libmem.NewAllocator(libmem.WithSystemNodes(opts.System))
+	p.memAllocator, err = libmem.NewAllocator(
+		libmem.WithSystemNodes(opts.System),
+		libmem.WithCustomFunctions(&libmem.CustomFunctions{
+			HandleOvercommit: func(overcommit map[libmem.NodeMask]int64, a libmem.CustomAllocator) error {
+				// When memory pinning is disabled the policy never pins memory; it
+				// leaves cpuset.mems empty (see applyGrant: mems stays empty unless
+				// opt.PinMemory). The internal per-zone/node memory model therefore
+				// enforces nothing, so it must not gate admission. Fail open: accept
+				// the overcommit and let the kernel place memory. Keep strict
+				// accounting when pinMemory is enabled.
+				if !opt.PinMemory {
+					log.Warnf("pinMemory=false: accepting memory overcommit %v (admission not enforced)", overcommit)
+					return nil
+				}
+				return a.DefaultHandleOvercommit(overcommit)
+			},
+		}),
+	)
 	if err != nil {
 		return policyError("failed to initialize %s policy: %w", err)
 	}
