@@ -72,12 +72,10 @@ var sharedPoolGaugeNames = []string{
 	gaugeSharedAvailable,
 }
 
-// newServerPolicyWithMetrics builds a real topology-aware policy from the
-// multi-zone "server" test sysfs and wires it to an OpenTelemetry manual
-// reader so the policy meters are real (not no-ops). It returns the policy,
-// the constructed metrics (NewTopologyAwareMetrics already calls Update()
-// once) and the manual reader used to collect them.
-func newServerPolicyWithMetrics(t *testing.T) (*policy, *TopologyAwareMetrics, *sdkmetric.ManualReader) {
+// newServerPolicy builds a real topology-aware policy from the multi-zone
+// "server" test sysfs. p.metrics is nil (Update is a no-op) and the mockCache
+// reports containers present so checkAllocations logs no STALE warnings.
+func newServerPolicy(t *testing.T) *policy {
 	t.Helper()
 
 	dir, err := os.MkdirTemp("", "nri-resource-policy-test-sysfs-")
@@ -98,7 +96,7 @@ func newServerPolicyWithMetrics(t *testing.T) (*policy, *TopologyAwareMetrics, *
 	}
 
 	opts := &policyapi.BackendOptions{
-		Cache:  &mockCache{},
+		Cache:  &mockCache{returnValue2ForLookupContainer: true},
 		System: sys,
 		Config: &cfgapi.Config{
 			ReservedResources: cfgapi.Constraints{
@@ -111,6 +109,19 @@ func newServerPolicyWithMetrics(t *testing.T) (*policy, *TopologyAwareMetrics, *
 	if err := p.Setup(opts); err != nil {
 		t.Fatalf("failed to set up policy: %v", err)
 	}
+
+	return p
+}
+
+// newServerPolicyWithMetrics builds a real topology-aware policy from the
+// multi-zone "server" test sysfs and wires it to an OpenTelemetry manual
+// reader so the policy meters are real (not no-ops). It returns the policy,
+// the constructed metrics (NewTopologyAwareMetrics already calls Update()
+// once) and the manual reader used to collect them.
+func newServerPolicyWithMetrics(t *testing.T) (*policy, *TopologyAwareMetrics, *sdkmetric.ManualReader) {
+	t.Helper()
+
+	p := newServerPolicy(t)
 
 	// The policy meters are gated by pkg/metrics, so the "policy" group and the
 	// provider must be set before NewTopologyAwareMetrics() builds them. These
