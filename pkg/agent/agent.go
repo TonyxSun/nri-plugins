@@ -18,9 +18,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -146,6 +148,8 @@ type Agent struct {
 	stopLock sync.Mutex
 	stopC    chan struct{}
 	doneC    chan struct{}
+
+	firstStatusWriteJitterDone bool // delay first status write once per process
 }
 
 // New creates an agent with the given options.
@@ -625,10 +629,49 @@ func (a *Agent) updateConfig(cfg metav1.Object) {
 	a.configure(cfg)
 }
 
+// statusStartupJitterMax is the upper bound for the first config status write
+// delay. Defaults to 10s; override with -status-startup-jitter (0 disables).
+var statusStartupJitterMax = 10 * time.Second
+
+// statusStartupJitter returns a deterministic delay in [0, statusStartupJitterMax)
+// derived from the node name via FNV-1a. An empty node name, or a non-positive
+// max, yields no delay.
+func statusStartupJitter(nodeName string) time.Duration {
+	if nodeName == "" || statusStartupJitterMax <= 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(nodeName))
+	return time.Duration(h.Sum64() % uint64(statusStartupJitterMax))
+}
+
+// delayFirstStatusWrite sleeps once before the first config status PATCH so
+// concurrent node restarts do not all hit the same etcd key at once. The delay
+// is interruptible by agent stop.
+func (a *Agent) delayFirstStatusWrite() {
+	if a.firstStatusWriteJitterDone {
+		return
+	}
+	a.firstStatusWriteJitterDone = true
+
+	delay := statusStartupJitter(a.nodeName)
+	if delay <= 0 {
+		return
+	}
+
+	log.Infof("delaying first config status write by %v", delay)
+	select {
+	case <-time.After(delay):
+	case <-a.stopC:
+	}
+}
+
 func (a *Agent) patchConfigStatus(prev, curr metav1.Object, errors error) {
 	if a.cfgIf == nil {
 		return
 	}
+
+	a.delayFirstStatusWrite()
 
 	prevName := ""
 	if prev != nil {
@@ -711,4 +754,6 @@ func init() {
 		"config file to use/monitor instead of a CustomResource")
 	flag.StringVar(&defaultKubeConfig, "kubeconfig", "",
 		"kubeconfig file to use, empty for in-cluster configuration")
+	flag.DurationVar(&statusStartupJitterMax, "status-startup-jitter", 10*time.Second,
+		"max delay before the first config status PATCH (0 disables); delay is hash(nodeName)%max")
 }
