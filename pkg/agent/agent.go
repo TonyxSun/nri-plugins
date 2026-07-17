@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -625,6 +626,8 @@ func (a *Agent) updateConfig(cfg metav1.Object) {
 	a.configure(cfg)
 }
 
+const statusPatchTimeout = 10 * time.Second
+
 func (a *Agent) patchConfigStatus(prev, curr metav1.Object, errors error) {
 	if a.cfgIf == nil {
 		return
@@ -640,7 +643,8 @@ func (a *Agent) patchConfigStatus(prev, curr metav1.Object, errors error) {
 		currName = curr.GetName()
 	}
 
-	ctx := context.TODO()
+	ctx, cancel := context.WithTimeout(context.Background(), statusPatchTimeout)
+	defer cancel()
 	ns := a.namespace
 	node := a.nodeName
 
